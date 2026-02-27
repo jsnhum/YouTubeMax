@@ -2,3 +2,4 @@ streamlit
 google-api-python-client
 isodate
 pandas
+youtube-transcript-api>=1.0

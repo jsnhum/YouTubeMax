@@ -16,7 +16,18 @@ Architecture
 
 import os
 import re
+import time
 from typing import Callable, Optional
+
+try:
+    from youtube_transcript_api import (
+        YouTubeTranscriptApi,
+        TranscriptsDisabled,
+        NoTranscriptFound,
+    )
+    _TRANSCRIPT_AVAILABLE = True
+except ImportError:
+    _TRANSCRIPT_AVAILABLE = False
 
 import isodate
 import pandas as pd
@@ -335,6 +346,159 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
+# ── Transcript functions (uses youtube-transcript-api, no API quota) ─────────
+
+
+def fetch_transcript(video_id: str, preferred_languages: list[str]) -> dict:
+    """
+    Fetch the transcript for a single YouTube video.
+
+    Tries each language in *preferred_languages* in order. If none are
+    available, falls back to the first transcript YouTube offers (any language).
+    Never raises – errors are captured in the ``"error"`` key of the result.
+
+    Parameters
+    ----------
+    video_id : str
+        YouTube video ID.
+    preferred_languages : list[str]
+        ISO 639-1 codes in preference order, e.g. ``["en", "ar"]``.
+
+    Returns
+    -------
+    dict
+        Keys: video_id, language, language_code, is_generated,
+              transcript_text, error.
+        ``transcript_text`` and language fields are ``None`` on failure;
+        ``error`` is ``None`` on success.
+    """
+    base: dict = {
+        "video_id": video_id,
+        "language": None,
+        "language_code": None,
+        "is_generated": None,
+        "transcript_text": None,
+        "error": None,
+    }
+
+    if not _TRANSCRIPT_AVAILABLE:
+        return {**base, "error": "youtube-transcript-api not installed"}
+
+    try:
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id)
+
+        # Try preferred languages; fall back to whatever YouTube has
+        try:
+            t = transcript_list.find_transcript(preferred_languages)
+        except NoTranscriptFound:
+            available = list(transcript_list)
+            if not available:
+                return {**base, "error": "No transcripts available for this video"}
+            t = available[0]
+
+        segments = t.fetch()
+        text = " ".join(seg.text for seg in segments)
+        return {
+            **base,
+            "language": t.language,
+            "language_code": t.language_code,
+            "is_generated": t.is_generated,
+            "transcript_text": text,
+        }
+
+    except TranscriptsDisabled:
+        return {**base, "error": "Transcripts disabled for this video"}
+    except Exception as exc:
+        return {**base, "error": str(exc)}
+
+
+def get_transcripts(
+    video_ids: list[str],
+    preferred_languages: Optional[list[str]] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    delay: float = 0.3,
+) -> pd.DataFrame:
+    """
+    Fetch transcripts for a list of YouTube video IDs.
+
+    Processes videos one at a time with a short *delay* between requests to
+    avoid hitting YouTube's rate limits. Failures are recorded in the ``error``
+    column rather than raising exceptions.
+
+    Parameters
+    ----------
+    video_ids : list[str]
+        YouTube video IDs to fetch transcripts for.
+    preferred_languages : list[str], optional
+        ISO 639-1 codes in preference order (default: ``["en"]``).
+    progress_callback : callable, optional
+        Called as ``progress_callback(done, total)`` after each video.
+    delay : float
+        Seconds to wait between requests (default 0.3 s).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: video_id, language, language_code, is_generated,
+                 transcript_text, error.
+    """
+    if preferred_languages is None:
+        preferred_languages = ["en"]
+
+    records: list[dict] = []
+    total = len(video_ids)
+
+    for i, vid in enumerate(video_ids):
+        records.append(fetch_transcript(vid, preferred_languages))
+        if progress_callback:
+            progress_callback(i + 1, total)
+        if i < total - 1:
+            time.sleep(delay)
+
+    return pd.DataFrame(records)
+
+
+def _parse_language_input(text: str) -> list[str]:
+    """
+    Parse a comma-separated string of ISO 639-1 language codes into a list.
+
+    Parameters
+    ----------
+    text : str
+        e.g. ``"en, ar, sv"``
+
+    Returns
+    -------
+    list[str]
+        e.g. ``["en", "ar", "sv"]``. Falls back to ``["en"]`` if input is blank.
+    """
+    codes = [c.strip().lower() for c in text.split(",") if c.strip()]
+    return codes if codes else ["en"]
+
+
+def _detect_id_column(df: pd.DataFrame) -> Optional[str]:
+    """
+    Heuristically find the video-ID column in an uploaded DataFrame.
+
+    Checks column names (case-insensitive) against a list of common names.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+
+    Returns
+    -------
+    str or None
+        Column name if found, otherwise ``None``.
+    """
+    known = {"video_id", "videoid", "video id", "id", "youtube_id", "url", "link"}
+    for col in df.columns:
+        if col.strip().lower() in known:
+            return col
+    return None
+
+
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 
@@ -388,6 +552,10 @@ def _init_session_state() -> None:
         "search_query": "",
         # Latest metadata download results (pd.DataFrame)
         "metadata_df": None,
+        # Transcripts fetched from the Metadata tab (tied to metadata_df)
+        "transcript_df": None,
+        # Transcripts fetched from the Transcripts tab (upload / paste)
+        "upload_transcript_df": None,
     }
     for key, default in defaults.items():
         if key not in st.session_state:
@@ -579,10 +747,11 @@ def render_search_tab() -> None:
         progress_bar.progress(1.0, text="Search complete!")
         status_text.empty()
 
-        # Store results and invalidate any stale metadata from a previous search
+        # Store results and invalidate stale metadata/transcripts from a previous search
         st.session_state.search_df = df
         st.session_state.search_query = query.strip()
         st.session_state.metadata_df = None
+        st.session_state.transcript_df = None
 
     # ── Display results ───────────────────────────────────────────────────────
     if st.session_state.search_df is not None:
@@ -678,6 +847,7 @@ def render_metadata_tab() -> None:
             "xyz789abc12, qrs456def78"
         ),
         label_visibility="collapsed",
+        key="meta_manual_ids",
     )
 
     if st.button("📥 Download metadata for pasted IDs", key="btn_meta_manual"):
@@ -752,6 +922,7 @@ def _run_metadata_download(video_ids: list[str]) -> None:
     status_text.empty()
 
     st.session_state.metadata_df = df
+    st.session_state.transcript_df = None  # Invalidate transcripts from previous metadata
     st.rerun()
 
 
@@ -819,6 +990,280 @@ def _render_metadata_results(df: pd.DataFrame) -> None:
         key="dl_metadata_csv",
     )
 
+    # ── Transcript download for these same videos ─────────────────────────────
+    st.divider()
+    st.subheader("📄 Download Transcripts")
+    st.caption(
+        "Fetch transcripts for the videos above. Uses no API quota – "
+        "transcripts are pulled directly from YouTube's player."
+    )
+
+    lang_input_meta = st.text_input(
+        "Preferred languages (comma-separated ISO 639-1 codes)",
+        value="en",
+        placeholder="e.g. en, ar, sv",
+        help=(
+            "Languages are tried in order. If none match, the first available "
+            "transcript for that video is used instead."
+        ),
+        key="meta_transcript_langs",
+    )
+
+    if st.button("📄 Fetch transcripts for these videos", key="btn_transcript_meta"):
+        video_ids = df["id"].tolist()
+        langs = _parse_language_input(lang_input_meta)
+        _run_transcript_download(video_ids, langs, state_key="transcript_df")
+
+    if st.session_state.transcript_df is not None:
+        _render_transcript_results(st.session_state.transcript_df, key_suffix="meta")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UI – Tab 3: Transcripts (upload / paste)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def render_transcripts_tab() -> None:
+    """
+    Render the Transcripts tab.
+
+    Provides two ways to supply video IDs:
+    1. Upload a CSV file that contains a column of video IDs or YouTube URLs.
+    2. Paste IDs or URLs directly into a text area.
+
+    Results are stored in ``st.session_state.upload_transcript_df``.
+    No YouTube Data API quota is consumed.
+    """
+    st.header("Download Transcripts")
+    st.caption(
+        "Fetch transcripts for any set of YouTube videos. "
+        "No API key or quota is needed – transcripts come directly from YouTube's player."
+    )
+
+    if not _TRANSCRIPT_AVAILABLE:
+        st.error(
+            "The `youtube-transcript-api` package is not installed. "
+            "Add it to requirements.txt and restart the app."
+        )
+        return
+
+    # ── Shared language preference ────────────────────────────────────────────
+    lang_input = st.text_input(
+        "Preferred languages (comma-separated ISO 639-1 codes)",
+        value="en",
+        placeholder="e.g. en, ar, sv",
+        help=(
+            "Languages are tried in the order you list them. "
+            "If none are available, the first transcript YouTube offers is used."
+        ),
+        key="upload_transcript_langs",
+    )
+    langs = _parse_language_input(lang_input)
+
+    # ── Source A: CSV upload ──────────────────────────────────────────────────
+    st.subheader("From uploaded CSV")
+    st.caption(
+        "Upload a CSV that contains a column of video IDs or YouTube URLs. "
+        "The app will auto-detect the right column, or let you pick one."
+    )
+
+    uploaded_file = st.file_uploader(
+        "CSV file with video IDs",
+        type=["csv"],
+        help="The file must contain a column with YouTube video IDs or full URLs.",
+    )
+
+    if uploaded_file is not None:
+        try:
+            df_upload = pd.read_csv(uploaded_file)
+        except Exception as exc:
+            st.error(f"Could not read CSV: {exc}")
+            df_upload = None
+
+        if df_upload is not None:
+            st.caption(f"Loaded {len(df_upload)} rows, {len(df_upload.columns)} columns.")
+
+            id_col = _detect_id_column(df_upload)
+            if id_col is None:
+                id_col = st.selectbox(
+                    "Which column contains video IDs or URLs?",
+                    options=df_upload.columns.tolist(),
+                    help="Pick the column that holds YouTube video IDs or watch URLs.",
+                )
+            else:
+                st.info(f"Auto-detected ID column: **{id_col}**")
+
+            raw_text = "\n".join(df_upload[id_col].astype(str).tolist())
+            ids_from_file = parse_video_ids(raw_text)
+
+            if ids_from_file:
+                st.caption(f"Parsed **{len(ids_from_file)}** unique video IDs.")
+                if st.button(
+                    f"📄 Fetch transcripts for {len(ids_from_file)} videos from file",
+                    key="btn_transcript_upload",
+                    type="primary",
+                ):
+                    _run_transcript_download(ids_from_file, langs, state_key="upload_transcript_df")
+            else:
+                st.warning(
+                    f"No valid YouTube video IDs found in column **{id_col}**. "
+                    "IDs are 11 characters (letters, digits, hyphens, underscores)."
+                )
+
+    st.divider()
+
+    # ── Source B: paste IDs / URLs ────────────────────────────────────────────
+    st.subheader("From pasted IDs or URLs")
+    st.caption(
+        "Paste any mix of bare video IDs, ``youtube.com/watch?v=…`` URLs, "
+        "or ``youtu.be/…`` short URLs. Separate with newlines, commas, or spaces."
+    )
+
+    paste_text = st.text_area(
+        "Video IDs / URLs",
+        height=160,
+        placeholder=(
+            "dQw4w9WgXcQ\n"
+            "https://www.youtube.com/watch?v=abc123def45\n"
+            "xyz789abc12, qrs456def78"
+        ),
+        label_visibility="collapsed",
+        key="transcript_paste_ids",
+    )
+
+    if st.button("📄 Fetch transcripts for pasted IDs", key="btn_transcript_paste"):
+        if not paste_text.strip():
+            st.warning("Please paste at least one video ID or URL.")
+        else:
+            ids_from_paste = parse_video_ids(paste_text)
+            if not ids_from_paste:
+                st.warning("No valid YouTube video IDs found in the pasted text.")
+            else:
+                st.info(f"Parsed **{len(ids_from_paste)}** unique video IDs.")
+                _run_transcript_download(
+                    ids_from_paste, langs, state_key="upload_transcript_df"
+                )
+
+    # ── Display results ───────────────────────────────────────────────────────
+    if st.session_state.upload_transcript_df is not None:
+        _render_transcript_results(
+            st.session_state.upload_transcript_df, key_suffix="upload"
+        )
+
+
+def _run_transcript_download(
+    video_ids: list[str],
+    preferred_languages: list[str],
+    state_key: str,
+) -> None:
+    """
+    Fetch transcripts for *video_ids* with a per-video progress bar.
+
+    Stores the resulting DataFrame in ``st.session_state[state_key]`` and
+    triggers a rerun so results render below the controls.
+
+    Parameters
+    ----------
+    video_ids : list[str]
+        YouTube video IDs.
+    preferred_languages : list[str]
+        ISO 639-1 codes in preference order.
+    state_key : str
+        Session state key to store results in (``"transcript_df"`` or
+        ``"upload_transcript_df"``).
+    """
+    n = len(video_ids)
+    progress_bar = st.progress(0, text=f"Fetching transcripts for {n} video(s)…")
+    status_text = st.empty()
+
+    def on_progress(done: int, total: int) -> None:
+        frac = min(done / max(total, 1), 1.0)
+        progress_bar.progress(frac, text=f"Video {done} of {total}…")
+        status_text.text(f"Fetched {done} transcript(s) so far.")
+
+    try:
+        df = get_transcripts(
+            video_ids=video_ids,
+            preferred_languages=preferred_languages,
+            progress_callback=on_progress,
+        )
+    except Exception as exc:
+        progress_bar.empty()
+        status_text.empty()
+        st.error(f"Unexpected error: {exc}")
+        return
+
+    progress_bar.progress(1.0, text="Done!")
+    status_text.empty()
+
+    st.session_state[state_key] = df
+    st.rerun()
+
+
+def _render_transcript_results(df: pd.DataFrame, key_suffix: str = "") -> None:
+    """
+    Display transcript results with a summary, preview table, and CSV download.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Output of ``get_transcripts()``.
+    key_suffix : str
+        Appended to widget keys to avoid collisions when this function is
+        called from multiple tabs.
+    """
+    n_total = len(df)
+    n_ok = int(df["transcript_text"].notna().sum())
+    n_fail = n_total - n_ok
+
+    st.divider()
+    st.subheader(f"Transcripts – {n_ok} of {n_total} videos")
+
+    if n_fail > 0:
+        st.warning(
+            f"**{n_fail}** video(s) had no transcript available "
+            "(disabled, private, or no captions)."
+        )
+        with st.expander("Show unavailable videos"):
+            failed_df = df[df["transcript_text"].isna()][["video_id", "error"]]
+            st.dataframe(failed_df, use_container_width=True, hide_index=True)
+
+    # Build display table: add link column and truncated preview
+    display_df = df.copy()
+    display_df.insert(
+        1, "url", "https://www.youtube.com/watch?v=" + display_df["video_id"]
+    )
+    display_df["preview"] = (
+        display_df["transcript_text"]
+        .fillna("")
+        .str[:300]
+        .where(display_df["transcript_text"].notna(), other="—")
+    )
+    display_df = display_df.drop(columns=["transcript_text"])
+
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "url": st.column_config.LinkColumn("Watch", display_text="▶ Open"),
+            "video_id": st.column_config.TextColumn("Video ID"),
+            "language": st.column_config.TextColumn("Language"),
+            "language_code": st.column_config.TextColumn("Code"),
+            "is_generated": st.column_config.CheckboxColumn("Auto-generated"),
+            "preview": st.column_config.TextColumn("Transcript preview"),
+            "error": st.column_config.TextColumn("Error"),
+        },
+    )
+
+    st.download_button(
+        label="⬇ Download full transcripts as CSV",
+        data=to_csv_bytes(df),
+        file_name="youtube_transcripts.csv",
+        mime="text/csv",
+        key=f"dl_transcripts_{key_suffix}",
+    )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Main entry point
@@ -845,14 +1290,19 @@ def main() -> None:
     )
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    # Add new tabs here as the app grows (transcripts, comments, channel info…)
-    tab_search, tab_metadata = st.tabs(["🔍 Search", "📥 Download Metadata"])
+    # Add new tabs here as the app grows (comments, channel info…)
+    tab_search, tab_metadata, tab_transcripts = st.tabs(
+        ["🔍 Search", "📥 Download Metadata", "📄 Transcripts"]
+    )
 
     with tab_search:
         render_search_tab()
 
     with tab_metadata:
         render_metadata_tab()
+
+    with tab_transcripts:
+        render_transcripts_tab()
 
 
 if __name__ == "__main__":
