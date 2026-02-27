@@ -24,6 +24,8 @@ import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from attribution import render_sidebar_attribution
+
 # ── Page configuration ────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="YouTubemax – Research Tool",
@@ -453,6 +455,8 @@ def render_sidebar() -> None:
             [Google Cloud Console](https://console.cloud.google.com/apis/dashboard).
             """
         )
+
+        render_sidebar_attribution()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
