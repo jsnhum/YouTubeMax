@@ -172,6 +172,80 @@ def search_videos(
     return pd.DataFrame(rows)
 
 
+def get_channel_video_ids(
+    api_key: str,
+    channel_id: str,
+    progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
+) -> list[str]:
+    """
+    Fetch every video ID uploaded by a YouTube channel.
+
+    Resolves the channel's "uploads" playlist, then paginates through it via
+    ``playlistItems().list`` – roughly 1 quota unit per page of 50 videos,
+    far cheaper than ``search().list`` (~100 units per page).
+
+    Parameters
+    ----------
+    api_key : str
+        YouTube Data API v3 key.
+    channel_id : str
+        Channel ID (starts with "UC…").
+    progress_callback : callable, optional
+        Called as ``progress_callback(collected, total)`` after each page.
+        ``total`` is the channel's public video count, or ``None`` if
+        unavailable.
+
+    Returns
+    -------
+    list[str]
+        Video IDs in upload order (newest first).
+
+    Raises
+    ------
+    ValueError
+        If no channel is found for *channel_id*.
+    """
+    youtube = build_youtube_client(api_key)
+
+    channel_response = (
+        youtube.channels()
+        .list(part="contentDetails,statistics", id=channel_id)
+        .execute()
+    )
+    items = channel_response.get("items", [])
+    if not items:
+        raise ValueError(f"No channel found for ID '{channel_id}'.")
+
+    uploads_playlist_id = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    total_videos = _to_int(items[0].get("statistics", {}).get("videoCount"))
+
+    video_ids: list[str] = []
+    page_token: Optional[str] = None
+
+    while True:
+        kwargs: dict = dict(
+            part="contentDetails",
+            playlistId=uploads_playlist_id,
+            maxResults=MAX_RESULTS_PER_PAGE,
+        )
+        if page_token:
+            kwargs["pageToken"] = page_token
+
+        response = youtube.playlistItems().list(**kwargs).execute()
+
+        for item in response.get("items", []):
+            video_ids.append(item["contentDetails"]["videoId"])
+
+        if progress_callback:
+            progress_callback(len(video_ids), total_videos)
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return video_ids
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def _fetch_metadata_batch(api_key: str, batch_ids: tuple) -> list[dict]:
     """
@@ -326,6 +400,30 @@ def parse_video_ids(text: str) -> list[str]:
             seen.add(vid)
             unique.append(vid)
     return unique
+
+
+def parse_channel_id(text: str) -> str:
+    """
+    Extract a bare channel ID from user input.
+
+    Accepts a bare ID (e.g. ``UCxxxxxxxxxxxxxxxxxxxxxx``) or a full
+    ``youtube.com/channel/UCxxxx…`` URL. Anything else is returned trimmed
+    as-is so the API call can surface a clear "channel not found" error
+    (handles/custom URLs like ``@name`` aren't resolved to IDs here).
+
+    Parameters
+    ----------
+    text : str
+        Raw user input.
+
+    Returns
+    -------
+    str
+        The extracted (or passed-through) channel ID.
+    """
+    text = text.strip()
+    match = re.search(r"channel/([A-Za-z0-9_-]+)", text)
+    return match.group(1) if match else text
 
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -864,6 +962,31 @@ def render_metadata_tab() -> None:
                 st.info(f"Parsed **{len(ids)}** unique video IDs.")
                 _run_metadata_download(ids)
 
+    st.divider()
+
+    # ── Source C: entire channel by channel ID ───────────────────────────────
+    st.subheader("From a channel ID")
+    st.caption(
+        "Enter a channel ID to fetch metadata for **every video the channel has "
+        "uploaded**. Channel IDs start with `UC…` and can be found on the "
+        "channel's 'About' page, or pasted as a full `youtube.com/channel/UC…` URL."
+    )
+
+    channel_id_input = st.text_input(
+        "Channel ID",
+        placeholder="e.g. UC_x5XG1OV2P6uZZ5FSM9Ttw",
+        key="meta_channel_id",
+    )
+
+    if st.button(
+        "📥 Download metadata for entire channel",
+        key="btn_meta_channel",
+        disabled=not channel_id_input.strip(),
+        help="Enter a channel ID to enable this button.",
+    ):
+        channel_id = parse_channel_id(channel_id_input)
+        _run_channel_download(channel_id)
+
     # ── Display cached metadata results ──────────────────────────────────────
     if st.session_state.metadata_df is not None:
         _render_metadata_results(st.session_state.metadata_df)
@@ -924,6 +1047,63 @@ def _run_metadata_download(video_ids: list[str]) -> None:
     st.session_state.metadata_df = df
     st.session_state.transcript_df = None  # Invalidate transcripts from previous metadata
     st.rerun()
+
+
+def _run_channel_download(channel_id: str) -> None:
+    """
+    Resolve *channel_id* to its full list of uploaded video IDs, then hand off
+    to ``_run_metadata_download`` to fetch metadata for all of them.
+
+    Parameters
+    ----------
+    channel_id : str
+        YouTube channel ID (e.g. ``UCxxxxxxxxxxxxxxxxxxxxxx``).
+    """
+    if not st.session_state.api_key:
+        st.error("Please enter your YouTube API key in the sidebar first.")
+        return
+
+    progress_bar = st.progress(0, text="Looking up channel…")
+    status_text = st.empty()
+
+    def on_channel_progress(collected: int, total: Optional[int]) -> None:
+        if total:
+            frac = min(collected / total, 1.0)
+            progress_bar.progress(frac, text=f"Found {collected} of ~{total} videos…")
+        else:
+            status_text.text(f"Found {collected} videos so far…")
+
+    try:
+        video_ids = get_channel_video_ids(
+            api_key=st.session_state.api_key,
+            channel_id=channel_id,
+            progress_callback=on_channel_progress,
+        )
+    except ValueError as exc:
+        progress_bar.empty()
+        status_text.empty()
+        st.error(str(exc))
+        return
+    except HttpError as exc:
+        progress_bar.empty()
+        status_text.empty()
+        st.error(f"YouTube API error: {exc}")
+        return
+    except Exception as exc:
+        progress_bar.empty()
+        status_text.empty()
+        st.error(f"Unexpected error: {exc}")
+        return
+
+    progress_bar.empty()
+    status_text.empty()
+
+    if not video_ids:
+        st.warning("This channel has no public videos.")
+        return
+
+    st.info(f"Found **{len(video_ids)}** videos on this channel. Fetching metadata…")
+    _run_metadata_download(video_ids)
 
 
 def _render_metadata_results(df: pd.DataFrame) -> None:
